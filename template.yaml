@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Provision an EKS cluster with self-managed nodes
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: nonprod-eks-usw2
+  KubernetesVersion:
+    Type: String
+    Default: "1.33"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0abc1234def567890
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Default:
+      - subnet-00aaa111
+      - subnet-00bbb222
+      - subnet-00ccc333
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+  NodeMinSize:
+    Type: Number
+    Default: 1
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+  NodeMaxSize:
+    Type: Number
+    Default: 3
+  AlbControllerPolicyArn:
+    Type: String
+    Default: arn:aws:iam::aws:policy/AWSLoadBalancerControllerIAMPolicy
+
+
+Resources:
+
+  ### OIDC provider for IRSA ###
+  EKSOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1]
+
+  ### IRSA Role for AWS LB Controller ###
+  AlbControllerServiceAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-alb-sa-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref EKSOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub "${EKSOidcProvider.OpenIdConnectIssuerUrl#https://}:sub": 
+                  - system:serviceaccount:kube-system:aws-load-balancer-controller
+      ManagedPolicyArns:
+        - !Ref AlbControllerPolicyArn
+
+  ## IAM Role for EC2 nodes
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+  ## Instance Profile for EC2 nodes (so they can assume the above Role)
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref NodeRole
+
+## IAM Role for the EKS control plane
+
+  EKSControlPlaneRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSServicePolicy
+
+
+  ## EKS Control Plane
+  EKSControlPlane:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      ResourcesVpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: false
+      RoleArn: !GetAtt EKSControlPlaneRole.Arn
+
+
+  ### SecurityGroup for worker nodes ###
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Worker nodes SG
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          SourceSecurityGroupId: !GetAtt EKSCluster.ClusterSecurityGroupId
+
+  ## NodeGroup for self-managed nodes
+  NonProdNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub "${ClusterName}-non-prod"
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets: !Ref PrivateSubnetIds
+      ScalingConfig:
+        MinSize: !Ref NodeMinSize
+        DesiredSize: !Ref NodeDesiredSize
+        MaxSize: !Ref NodeMaxSize
+      AmiType: AL2_X86_64                 # <-- Use the Amazon Linux 2, x86_64, EKS-optimized AMI
+      InstanceTypes: [!Ref NodeInstanceType]
+      Labels:
+        env: non-prod
+        nodegroup: self-managed
+
+  # EKS Add-ons
+  ##############################
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: "vpc-cni"
+      ClusterName: !Ref ClusterName
+      ResolveConflicts: OVERWRITE
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: "coredns"
+      ClusterName: !Ref ClusterName
+      ResolveConflicts: OVERWRITE
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: "kube-proxy"
+      ClusterName: !Ref ClusterName
+      ResolveConflicts: OVERWRITE
+  EbsCsiDriverAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: "aws-ebs-csi-driver"
+      ClusterName: !Ref ClusterName
+      ResolveConflicts: OVERWRITE 
+  
+
+
+Outputs:
+  NodeRoleArn:
+    Description: "ARN of the EC2 node IAM Role"
+    Value: !GetAtt NodeRole.Arn
+  InstanceProfileArn:
+    Description: "ARN of the EC2 node Instance Profile"
+    Value: !GetAtt NodeInstanceProfile.Arn
+  ClusterEndpoint:
+    Description: "EKS API Server endpoint"
+    Value: !GetAtt EKSControlPlane.Endpoint
+  AlbControllerRoleArn:
+    Description: “The ARN of the IRSA role for the AWS LB Controller”
+    Value: !GetAtt AlbControllerServiceAccountRole.Arn
